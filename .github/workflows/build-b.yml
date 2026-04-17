@@ -1,0 +1,124 @@
+name: Build B (AI Fix Pipeline)
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_call:
+    inputs:
+      buildError:
+        required: true
+        type: string
+    secrets:
+      GOOGLE_AI_API_KEY:
+        required: true
+      PAT_TOKEN:
+        required: true
+
+jobs:
+  process-error:
+    if: ${{ inputs.buildError != 'No errors' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # ✅ Checkout
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # ✅ Git Auth
+      - name: Setup Git Auth
+        run: |
+          git config --global user.name "ancyrus1"
+          git config --global user.email "ancyrusansh@gmail.com"
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}
+
+      # ✅ Read workflow safely
+      - name: Read Current Workflow
+        id: read_yaml
+        run: |
+          {
+            echo 'workflow<<DELIM'
+            cat .github/workflows/dotnet.yml
+            echo 'DELIM'
+          } >> $GITHUB_OUTPUT
+
+      # ✅ Python setup
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - run: pip install google-genai
+
+      # ✅ Generate AI Fix
+      - name: Generate Fix
+        env:
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
+          BUILD_ERROR: ${{ inputs.buildError }}
+          CURRENT_WORKFLOW: ${{ steps.read_yaml.outputs.workflow }}
+        run: |
+          python - <<'EOF'
+          import os, json, re
+          from google import genai
+
+          client = genai.Client(api_key=os.environ["GOOGLE_AI_API_KEY"])
+
+          prompt = f"""
+          Return ONLY JSON:
+          {{
+            "fixed_workflow": "<FULL FIXED YAML>",
+            "commit_message": "fix: ci issue"
+          }}
+
+          CURRENT WORKFLOW:
+          {os.environ["CURRENT_WORKFLOW"]}
+
+          ERROR:
+          {os.environ["BUILD_ERROR"]}
+          """
+
+          response = client.models.generate_content(
+              model="models/gemini-2.5-flash",
+              contents=prompt
+          )
+
+          text = response.text
+          match = re.search(r'\{[\s\S]*\}', text)
+
+          data = json.loads(match.group(0))
+
+          with open("ai_fix.json", "w") as f:
+              json.dump(data, f)
+          EOF
+
+      # ✅ Apply Fix
+      - name: Apply Fix
+        run: |
+          python - <<'EOF'
+          import json, os
+          data = json.load(open("ai_fix.json"))
+
+          os.makedirs("ai-fixes", exist_ok=True)
+          open("ai-fixes/dotnet.yml", "w").write(data["fixed_workflow"])
+          EOF
+
+      # ✅ Create branch & commit
+      - name: Commit Fix
+        run: |
+          git checkout -b ai-fix-${{ github.run_id }}
+          git add ai-fixes/
+          git commit -m "AI Fix: CI failure" || echo "No changes"
+
+      # ✅ Promote fix to workflow
+      - name: Promote Fix
+        run: |
+          cp ai-fixes/dotnet.yml .github/workflows/dotnet.yml
+          git add .github/workflows/dotnet.yml
+          git commit -m "Apply AI fix"
+
+      # ✅ Push
+      - name: Push
+        run: |
+          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }} ai-fix-${{ github.run_id }}
